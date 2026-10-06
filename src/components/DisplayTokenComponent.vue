@@ -163,14 +163,14 @@
         <div v-if="qrCodeFragment" class="row justify-center q-mb-md">
           <div class="col-12 col-sm-11 col-md-8 q-px-md">
             <q-responsive :ratio="1" class="q-mx-none">
-              <vue-qrcode
+              <TokenQrCode
                 :value="qrCodeFragment"
-                :options="{ width: 600, height: 600 }"
                 class="rounded-borders"
                 style="width: 100%; height: 100%"
                 @click="copyTokens"
+                @error="handleQrError"
               >
-              </vue-qrcode>
+              </TokenQrCode>
             </q-responsive>
             <div style="height: 2px">
               <q-linear-progress
@@ -197,7 +197,7 @@
                   @click="changeSpeed"
                 >
                   <q-icon name="speed" style="margin-right: 8px"></q-icon>
-                  Speed: {{ fragmentSpeedLabel }}
+                  Speed: {{ 1000 / currentFragmentInterval }} fps
                 </q-btn>
                 <q-btn
                   v-if="showAnimatedQR"
@@ -208,8 +208,25 @@
                   @click="changeSize"
                 >
                   <q-icon name="zoom_in" style="margin-right: 8px"></q-icon>
-                  Size: {{ fragmentLengthLabel }}
+                  Size: {{ currentFragmentLength }} B
+                  <q-tooltip>
+                    Restart scanning after changing size. In compatibility mode,
+                    this sets fragment size rather than total QR bytes.
+                  </q-tooltip>
                 </q-btn>
+                <q-toggle
+                  v-if="showAnimatedQR"
+                  v-model="useLegacyQr"
+                  label="Compatibility (UR)"
+                  size="xs"
+                  color="grey"
+                  @update:model-value="startQrCodeLoop"
+                >
+                  <q-tooltip>
+                    Use for wallets that cannot scan the new format. Restart
+                    scanning after switching formats.
+                  </q-tooltip>
+                </q-toggle>
               </div>
             </div>
           </div>
@@ -320,9 +337,14 @@
   </q-dialog>
 </template>
 <script lang="ts">
-import { defineComponent } from "vue";
-import { Buffer } from "buffer";
-import { UR, UREncoder } from "@gandlaf21/bc-ur";
+import { defineComponent, markRaw } from "vue";
+import TokenQrCode from "src/components/TokenQrCode.vue";
+import {
+  createTokenQrEncoder,
+  TOKEN_QR_BYTES,
+  TOKEN_QR_INTERVAL,
+  type TokenQrFrame,
+} from "src/js/tokenQr";
 import { mapActions, mapState, mapWritableState } from "pinia";
 import { useSendTokensStore } from "src/stores/sendTokensStore";
 import { useTransactionWorkerStore } from "src/stores/transactionWorker";
@@ -331,10 +353,10 @@ import { useCameraStore } from "src/stores/camera";
 import { useSettingsStore } from "src/stores/settings";
 import { useTokensStore } from "src/stores/tokens";
 import { useMintsStore } from "src/stores/mints";
-import TokenInformation from "components/TokenInformation.vue";
-import MeltQuoteInformation from "components/MeltQuoteInformation.vue";
-import SendPaymentRequest from "./SendPaymentRequest.vue";
-import PaymentRequestInfo from "./PaymentRequestInfo.vue";
+import TokenInformation from "src/components/TokenInformation.vue";
+import MeltQuoteInformation from "src/components/MeltQuoteInformation.vue";
+import SendPaymentRequest from "src/components/SendPaymentRequest.vue";
+import PaymentRequestInfo from "src/components/PaymentRequestInfo.vue";
 import { getDecodedToken, getEncodedTokenBinary } from "@cashu/cashu-ts";
 import { sumProofAmounts } from "src/js/proofs";
 import token from "src/js/token";
@@ -353,6 +375,7 @@ export default defineComponent({
   name: "DisplayTokenComponent",
   mixins: [windowMixin],
   components: {
+    TokenQrCode,
     TokenInformation,
     MeltQuoteInformation,
     SendPaymentRequest,
@@ -366,20 +389,12 @@ export default defineComponent({
     return {
       baseURL: location.protocol + "//" + location.host + location.pathname,
       showAnimatedQR: false,
-      qrCodeFragment: "",
-      qrInterval: null as any,
-      encoder: null as any,
-      // animated QR params
-      currentFragmentLength: 150,
-      fragmentLengthMedium: 100,
-      fragmentLengthShort: 50,
-      fragmentLengthLong: 150,
-      fragmentLengthLabel: "L",
-      currentFragmentInterval: 150,
-      fragmentIntervalMedium: 250,
-      fragmentIntervalFast: 150,
-      framentInervalSlow: 500,
-      fragmentSpeedLabel: "F",
+      qrCodeFragment: "" as TokenQrFrame,
+      qrInterval: null as ReturnType<typeof setInterval> | null,
+      encoder: null as ReturnType<typeof createTokenQrEncoder> | null,
+      currentFragmentLength: TOKEN_QR_BYTES,
+      currentFragmentInterval: TOKEN_QR_INTERVAL,
+      useLegacyQr: false,
       scanningCard: false,
       showExpandedButtons: false,
       showDeleteDialog: false,
@@ -422,22 +437,8 @@ export default defineComponent({
     },
   },
   watch: {
-    "sendData.tokensBase64": function (val: string) {
-      this.showAnimatedQR = false;
-      if (!val?.length) {
-        return;
-      }
-      const tokenObj = token.decodeMeta(val);
-      const proofs = tokenObj.proofs || [];
-      if (!proofs.length) {
-        return;
-      } else if (proofs.length <= 2) {
-        this.qrCodeFragment = val;
-      } else {
-        this.showAnimatedQR = true;
-        this.qrCodeFragment = "";
-        this.startQrCodeLoop();
-      }
+    "sendData.tokensBase64": function () {
+      this.initQr();
     },
   },
   methods: {
@@ -452,66 +453,86 @@ export default defineComponent({
     toggleExpandButtons() {
       this.showExpandedButtons = !this.showExpandedButtons;
     },
-    initQr: function () {
-      const val = this.sendData?.tokensBase64;
+    stopQrCodeLoop() {
+      if (this.qrInterval !== null) clearInterval(this.qrInterval);
+      this.qrInterval = null;
+      this.encoder = null;
+    },
+    initQr() {
+      this.stopQrCodeLoop();
+      this.qrCodeFragment = "";
       this.showAnimatedQR = false;
-      if (!val?.length) {
-        this.qrCodeFragment = "";
-        return;
-      }
-      const tokenObj = token.decodeMeta(val);
-      const proofs = tokenObj.proofs || [];
-      if (!proofs.length) {
-        this.qrCodeFragment = "";
-        return;
-      } else if (proofs.length <= 2) {
-        this.qrCodeFragment = val;
-      } else {
-        this.showAnimatedQR = true;
-        this.qrCodeFragment = "";
-        this.startQrCodeLoop();
+      const value = this.sendData?.tokensBase64;
+      if (!value) return;
+      try {
+        const proofs = token.decodeMeta(value)?.proofs || [];
+        if (!proofs.length) return;
+        // Long secrets/memos can make even a one-proof token too dense.
+        if (
+          proofs.length <= 2 &&
+          new TextEncoder().encode(value).length <= 1000
+        ) {
+          this.qrCodeFragment = value;
+        } else {
+          this.showAnimatedQR = true;
+          this.startQrCodeLoop();
+        }
+      } catch (error) {
+        this.handleQrError(error);
       }
     },
-    startQrCodeLoop: async function () {
-      if (this.sendData.tokensBase64.length == 0) {
-        return;
+    startQrCodeLoop() {
+      this.stopQrCodeLoop();
+      if (!this.sendData.tokensBase64) return;
+      try {
+        this.encoder = markRaw(
+          createTokenQrEncoder(
+            this.sendData.tokensBase64,
+            this.currentFragmentLength,
+            this.useLegacyQr ? "ur" : "fountain"
+          )
+        );
+        this.updateQrCode();
+        this.scheduleQrFrames();
+      } catch (error) {
+        this.handleQrError(error);
       }
-      const messageBuffer = Buffer.from(this.sendData.tokensBase64);
-      const ur = UR.fromBuffer(messageBuffer);
-      const firstSeqNum = 0;
-      this.encoder = new UREncoder(ur, this.currentFragmentLength, firstSeqNum);
-      clearInterval(this.qrInterval);
-      this.qrInterval = setInterval(() => {
-        this.qrCodeFragment = this.encoder.nextPart();
-      }, this.currentFragmentInterval);
     },
-    updateQrCode: function () {
-      this.qrCodeFragment = this.encoder.nextPart();
+    scheduleQrFrames() {
+      if (this.qrInterval !== null) clearInterval(this.qrInterval);
+      this.qrInterval = setInterval(
+        this.updateQrCode,
+        this.currentFragmentInterval
+      );
     },
-    changeSpeed: function () {
-      if (this.currentFragmentInterval == this.fragmentIntervalMedium) {
-        this.currentFragmentInterval = this.framentInervalSlow;
-        this.fragmentSpeedLabel = "S";
-      } else if (this.currentFragmentInterval == this.framentInervalSlow) {
-        this.currentFragmentInterval = this.fragmentIntervalFast;
-        this.fragmentSpeedLabel = "F";
-      } else {
-        this.currentFragmentInterval = this.fragmentIntervalMedium;
-        this.fragmentSpeedLabel = "M";
+    updateQrCode() {
+      try {
+        if (this.encoder) this.qrCodeFragment = this.encoder.nextPart();
+      } catch (error) {
+        this.handleQrError(error);
       }
-      this.startQrCodeLoop();
     },
-    changeSize: function () {
-      if (this.currentFragmentLength == this.fragmentLengthMedium) {
-        this.currentFragmentLength = this.fragmentLengthShort;
-        this.fragmentLengthLabel = "S";
-      } else if (this.currentFragmentLength == this.fragmentLengthShort) {
-        this.currentFragmentLength = this.fragmentLengthLong;
-        this.fragmentLengthLabel = "L";
-      } else {
-        this.currentFragmentLength = this.fragmentLengthMedium;
-        this.fragmentLengthLabel = "M";
-      }
+    handleQrError(error: unknown) {
+      this.stopQrCodeLoop();
+      this.qrCodeFragment = "";
+      notifyError(
+        error instanceof Error ? error.message : "Could not display token QR"
+      );
+    },
+    changeSpeed() {
+      const intervals = [50, 100, 200];
+      this.currentFragmentInterval =
+        intervals[
+          (intervals.indexOf(this.currentFragmentInterval) + 1) %
+            intervals.length
+        ];
+      // Changing speed must not restart the fountain sequence.
+      if (this.encoder) this.scheduleQrFrames();
+    },
+    changeSize() {
+      const sizes = [256, 128, 512];
+      this.currentFragmentLength =
+        sizes[(sizes.indexOf(this.currentFragmentLength) + 1) % sizes.length];
       this.startQrCodeLoop();
     },
     encodeToPeanut: function (tokenStr: string) {
@@ -674,7 +695,7 @@ export default defineComponent({
     this.initQr();
   },
   beforeUnmount() {
-    clearInterval(this.qrInterval);
+    this.stopQrCodeLoop();
     if (this.copyButtonTimeout) {
       clearTimeout(this.copyButtonTimeout);
     }

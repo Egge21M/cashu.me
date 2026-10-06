@@ -10,6 +10,7 @@
 
 const { configure } = require("quasar/wrappers");
 const { execSync } = require("child_process");
+const path = require("path");
 
 function resolveGitCommit() {
   try {
@@ -25,7 +26,7 @@ function resolveGitCommit() {
   }
 }
 
-module.exports = configure(function (/* ctx */) {
+module.exports = configure(function (ctx) {
   return {
     eslint: {
       // fix: true,
@@ -85,6 +86,25 @@ module.exports = configure(function (/* ctx */) {
       // distDir
 
       extendViteConf(viteConf) {
+        // Vite 2 has no ?worker&url support, while QrScanner needs a URL
+        // rather than a worker constructor. Emit our worker as an ESM entry.
+        const workerModule = "virtual:qr-scanner-worker-url";
+        viteConf.plugins = viteConf.plugins || [];
+        viteConf.plugins.push({
+          name: "qr-scanner-worker-url",
+          resolveId(id) {
+            if (id === workerModule) return "\0" + workerModule;
+          },
+          load(id) {
+            if (id !== "\0" + workerModule) return;
+            if (ctx.dev) return 'export default "/src/js/qrScannerWorker.ts"';
+            const worker = this.emitFile({
+              type: "chunk",
+              id: path.resolve(__dirname, "src/js/qrScannerWorker.ts"),
+            });
+            return `export default import.meta.ROLLUP_FILE_URL_${worker}`;
+          },
+        });
         viteConf.define = viteConf.define || {};
         viteConf.define.GIT_COMMIT = JSON.stringify(resolveGitCommit());
         // cashu-ts v4 ships ESM with BigInt — Vite's dep optimizer can mangle it

@@ -1,7 +1,10 @@
 <script lang="ts">
 import QrScanner, { type ScanResult } from "@agicash/qr-scanner";
-import { URDecoder } from "@gandlaf21/bc-ur";
+import { markRaw } from "vue";
+import { TokenQrDecoder, scannedHexToBytes } from "src/js/tokenQr";
+import { notifyError } from "src/js/notify";
 import zxingReaderWasmUrl from "zxing-wasm/reader/zxing_reader.wasm?url";
+import scannerWorkerUrl from "virtual:qr-scanner-worker-url";
 import { useCameraStore } from "src/stores/camera";
 import { mapActions, mapState } from "pinia";
 import { useUiStore } from "src/stores/ui";
@@ -9,39 +12,49 @@ import { useUiStore } from "src/stores/ui";
 QrScanner.configureWasm({
   locateFile: () => zxingReaderWasmUrl,
 });
+QrScanner.setWorkerUrl(scannerWorkerUrl);
 
 export default {
   emits: ["decode"],
   data(): {
     qrScanner: QrScanner | null;
-    urDecoder: URDecoder | null;
-    urDecoderProgress: number;
+    decoder: TokenQrDecoder;
+    decoderProgress: number;
+    scanComplete: boolean;
   } {
     return {
       qrScanner: null,
-      urDecoder: null,
-      urDecoderProgress: 0,
+      decoder: markRaw(new TokenQrDecoder()),
+      decoderProgress: 0,
+      scanComplete: false,
     };
   },
   mounted() {
-    this.qrScanner = new QrScanner(
-      this.$refs.cameraEl as HTMLVideoElement,
-      (result: ScanResult) => {
-        this.handleResult(result);
-      },
-      {
-        calculateScanRegion: (video) => ({
-          x: 0,
-          y: 0,
-          width: video.videoWidth,
-          height: video.videoHeight,
-        }),
-        highlightCodeOutline: true,
-        onDecodeError: () => {},
-      }
+    this.qrScanner = markRaw(
+      new QrScanner(
+        this.$refs.cameraEl as HTMLVideoElement,
+        (result: ScanResult) => {
+          this.handleResult(result);
+        },
+        {
+          calculateScanRegion: (video) => ({
+            x: 0,
+            y: 0,
+            width: video.videoWidth,
+            height: video.videoHeight,
+          }),
+          // The wrapper only exposes text. Hex preserves ZXing's raw bytes
+          // without guessing a character encoding for binary fountain frames.
+          decoderOptions: { textMode: "Hex" },
+          maxScansPerSecond: 30,
+          highlightCodeOutline: true,
+          onDecodeError: () => {},
+        }
+      )
     );
-    this.qrScanner.start();
-    this.urDecoder = new URDecoder();
+    this.qrScanner.start().catch((error: Error) => {
+      if (!this.scanComplete) notifyError(error.message);
+    });
   },
   computed: {
     ...mapState(useCameraStore, ["camera", "hasCamera"]),
@@ -56,31 +69,36 @@ export default {
   methods: {
     ...mapActions(useCameraStore, ["closeCamera", "showCamera"]),
     handleResult(result: ScanResult) {
-      // if this is a multipart-qr code, do not yet emit
-      if (result.data.toLowerCase().startsWith("ur:")) {
-        this.urDecoder?.receivePart(result.data);
-        this.urDecoderProgress =
-          this.urDecoder?.estimatedPercentComplete() || 0;
-        if (this.urDecoder?.isComplete() && this.urDecoder?.isSuccess()) {
-          const ur = this.urDecoder?.resultUR();
-          const decoded = ur.decodeCBOR();
-          this.$emit("decode", decoded.toString());
-          this.qrScanner?.stop();
-          this.urDecoderProgress = 0;
-        }
-      } else {
-        this.$emit("decode", result.data);
-        this.qrScanner?.stop();
+      if (this.scanComplete) return;
+      try {
+        const decoded = this.decoder.receive(scannedHexToBytes(result.data));
+        if (decoded) this.finishScan(decoded);
+      } catch {
+        // Ignore damaged or foreign frames without discarding valid progress.
+        // The user can reset the session to scan a different transfer.
       }
+      this.decoderProgress = this.scanComplete ? 0 : this.decoder.progress;
+    },
+    resetScan() {
+      this.decoder.reset();
+      this.decoderProgress = 0;
+    },
+    finishScan(text: string) {
+      if (this.scanComplete) return;
+      this.scanComplete = true;
+      // Let the scanner finish drawing this frame's outline before clearing
+      // the video stream (which resets its dimensions to zero).
+      queueMicrotask(() => this.qrScanner?.stop());
+      this.decoderProgress = 0;
+      this.$emit("decode", text);
     },
     pasteToParseDialog: async function () {
       const text = await useUiStore().pasteFromClipboard();
-      if (text) {
-        this.$emit("decode", text);
-      }
+      if (text) this.finishScan(text);
     },
   },
-  unmounted() {
+  beforeUnmount() {
+    this.scanComplete = true;
     this.qrScanner?.destroy();
   },
 };
@@ -96,9 +114,9 @@ export default {
           <q-linear-progress
             rounded
             size="30px"
-            v-if="urDecoderProgress > 0"
-            :value="urDecoderProgress"
-            :indeterminate="urDecoderProgress === 0"
+            v-if="decoderProgress > 0"
+            :value="decoderProgress"
+            :indeterminate="decoderProgress === 0"
             class="q-mt-none"
             color="secondary"
           >
@@ -111,10 +129,10 @@ export default {
                 :label="
                   $t('QrcodeReader.progress.text', {
                     percentage: $t('QrcodeReader.progress.percentage', {
-                      percentage: Math.round(urDecoderProgress * 100),
+                      percentage: Math.round(decoderProgress * 100),
                     }),
                     addon:
-                      urDecoderProgress > 0.9
+                      decoderProgress > 0.9
                         ? $t('QrcodeReader.progress.keep_scanning_text')
                         : '',
                   })
@@ -126,6 +144,7 @@ export default {
       </div>
     </div>
     <div class="row q-my-sm">
+      <q-btn flat @click="resetScan"> Restart scan </q-btn>
       <q-btn
         unelevated
         v-if="canPasteFromClipboard"
